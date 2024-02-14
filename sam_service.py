@@ -2,9 +2,12 @@ import os
 import gc
 import numpy as np
 import torch
+import uuid
 from osgeo import gdal, osr, ogr
-import tempfile
-import settings
+from skimage import filters
+from skimage.morphology import disk
+import geopandas as gpd
+from shapely.validation import make_valid
 
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
@@ -57,36 +60,35 @@ class SAMService:
             id += 1
         return full_image
 
-    def save_full_mask(self, image_dataset, mask, output_path):
-        mem_dataset = image_dataset \
-            .GetDriver() \
-            .Create(output_path, mask.shape[1], mask.shape[0], 1, gdal.GDT_Int16)
+    def remove_bordes(self, image):
+        image = image.reshape((image.shape[0], image.shape[1])).astype(int)
+        filled_image = filters.rank.modal(image, disk(10))
+        return filled_image.reshape((filled_image.shape[0], filled_image.shape[1], 1))
+
+
+    def save_full_mask(self, image_dataset, mask):
+        # MEM
+        # GTiff
+        mem_dataset = gdal.GetDriverByName("MEM") \
+            .Create(uuid.uuid4().hex, mask.shape[1], mask.shape[0], 1, gdal.GDT_Int16)
 
         mem_dataset.SetGeoTransform(image_dataset.GetGeoTransform())
         mem_dataset.SetProjection(image_dataset.GetProjection())
         mem_dataset.GetRasterBand(1) \
             .WriteArray(mask.reshape((mask.shape[0], mask.shape[1])), 0, 0)
         mem_dataset.FlushCache()
-        return output_path
+        return mem_dataset
 
-    def convert_raster_to_vector(self, input_raster_path, output_vector_path):
-        # load raster band
-        raster = gdal.Open(input_raster_path)
-        raster_band = raster.GetRasterBand(1)
+    def convert_raster_to_vector(self, full_mask, output_vector_path):
+        # reshape mask
+        raster_band = full_mask.GetRasterBand(1)
 
         # get raster projection
         projection = osr.SpatialReference()
-        projection.ImportFromWkt(raster.GetProjectionRef())
-
-        # get Shapefile driver
-        shp_driver = ogr.GetDriverByName("GPKG")
-
-        # create shapefile dataset
-        if os.path.exists(output_vector_path):
-            shp_driver.DeleteDataSource(output_vector_path)
+        projection.ImportFromWkt(full_mask.GetProjectionRef())
 
         # create layer
-        new_shp = shp_driver.CreateDataSource(output_vector_path)
+        new_shp = ogr.GetDriverByName("Memory").CreateDataSource(output_vector_path)
         new_shp.CreateLayer('mask', geom_type=ogr.wkbPolygon, srs=projection)
 
         # get layer
@@ -96,42 +98,76 @@ class SAMService:
         new_field = ogr.FieldDefn('id', ogr.OFTInteger)
         dst_layer.CreateField(new_field)
 
-        # Polygonize(band, hMaskBand[optional]=None, destination lyr, field ID, papszOptions=[], callback=None)
         gdal.Polygonize(raster_band, None, dst_layer, 0, [], callback=None)
+        return new_shp
 
-    def predict(self, input_image_path: str, output_fields_path: str):
-        print(f'Loading image {input_image_path}  ...')
-        image_dataset = gdal.Open(input_image_path)
+    def remove_stripes(self, old_final_gdf):
+        final_gdf = old_final_gdf.reset_index(drop=True).explode(
+            ignorar_index=True,
+            index_parts=True)
 
-        print(image_dataset.GetRasterBand(1).GetStatistics(True, True))
+        final_gdf['geometry_type'] = final_gdf.geometry.geom_type
+        final_gdf = final_gdf[final_gdf['geometry_type'].isin(['Polygon', 'MultiPolygon'])]
 
-        print(image_dataset.GetMetadata())
+        final_gdf['area_ha'] = final_gdf.area / 10000
+        final_gdf = final_gdf.sort_values('area_ha')
 
+        final_gdf['id'] = range(len(final_gdf))
+        final_gdf['new_id'] = final_gdf['id']
+
+        gdf_overlaps = gpd.overlay(final_gdf, final_gdf, how='intersection', keep_geom_type=True, make_valid=True)
+        gdf_overlaps['intersection_area_ha'] = gdf_overlaps['geometry'].area / 10000
+        gdf_overlaps = gdf_overlaps[
+            (gdf_overlaps['id_1'] != gdf_overlaps['id_2']) & (gdf_overlaps['intersection_area_ha'] > 0.01)]
+
+        gdf_overlaps['id_min'] = gdf_overlaps.apply(lambda x: min(x['id_1'], x['id_2']), axis=1)
+        gdf_overlaps['id_max'] = gdf_overlaps.apply(lambda x: max(x['id_1'], x['id_2']), axis=1)
+
+        gdf_overlaps = gdf_overlaps.drop_duplicates(['id_min', 'id_max', 'intersection_area_ha'])
+
+        while True:
+            gdf_overlaps = gdf_overlaps[(gdf_overlaps['id_min'] != gdf_overlaps['id_max'])]
+
+            if gdf_overlaps.empty:
+                break
+
+            for id in list(gdf_overlaps['id_min'].unique()):
+                intersections_rows = gdf_overlaps[(gdf_overlaps['id_min'] == id)]
+
+                id_max = intersections_rows.sort_values('intersection_area_ha', ascending=False)['id_max'].to_list()[0]
+
+                gdf_overlaps.loc[(gdf_overlaps['id_min'] == id) & (gdf_overlaps['id_max'] == id_max), 'id_max'] = id
+
+                final_gdf.loc[final_gdf['id'] == id, 'new_id'] = id_max
+
+            final_gdf['geometry'] = final_gdf['geometry'].apply(make_valid)
+            final_gdf = final_gdf.dissolve(by=['new_id'], aggfunc='max', as_index=False)
+            final_gdf['area_ha'] = final_gdf.area / 10000
+
+        return final_gdf
+
+    def predict(self, image_dataset, output_fields_path: str):
+        print('Get array')
         image_array = image_dataset.ReadAsArray().transpose(1, 2, 0)
-        gc.collect()
 
         print('Normalizing image...')
         image_array = self.normalize_image(image_array)
-        gc.collect()
 
         print('Generating masks...')
         masks = self.get_masks(image_array)
-        gc.collect()
 
         print('Generating full mask...')
         full_mask = self.convert_masks_to_full_mask(image_array, masks)
-        gc.collect()
+
+        print('Remove border full mask...')
+        full_mask = self.remove_bordes(full_mask)
 
         print('Exporting full mask...')
-        image_filename, image_extension = os.path.splitext(input_image_path)
-        mask_output_path = f'{image_filename}_mask{image_extension}'
-        output_mask_path = self.save_full_mask(image_dataset, full_mask, mask_output_path)
-        gc.collect()
+        full_mask_image = self.save_full_mask(image_dataset, full_mask)
 
-        print('Vetorizing mask...')
-        self.convert_raster_to_vector(output_mask_path, output_fields_path)
+        return self.convert_raster_to_vector(full_mask_image, output_fields_path)
 
-    def predict_chips(self, input_file, output_file, reference=osr.SpatialReference()):
+    def predict_chips(self, input_file, output_file):
         image_dataset = gdal.Open(input_file)
 
         geotransform = image_dataset.GetGeoTransform()
@@ -146,60 +182,79 @@ class SAMService:
         num_pedacos_x = int(largura_imagem / largura_pedaco) + (largura_imagem % largura_pedaco > 0)
         num_pedacos_y = int(altura_imagem / altura_pedaco) + (altura_imagem % altura_pedaco > 0)
 
-        with tempfile.TemporaryDirectory() as tmpdirname:
+        output_file_prefix, output_file_extension = output_file.split('.')
+        output_file_raw = f'{output_file_prefix}_raw.{output_file_extension}'
 
-            fields_driver = ogr.GetDriverByName('GPKG')
-            fields_dataset = fields_driver.CreateDataSource(output_file)
+        fields_driver = ogr.GetDriverByName('GPKG')
+        fields_dataset = fields_driver.CreateDataSource(output_file_raw)
 
-            proj = osr.SpatialReference(wkt=image_dataset.GetProjection())
+        proj = osr.SpatialReference(wkt=image_dataset.GetProjection())
 
-            fields_layer = fields_dataset.CreateLayer('main',
-                                                      geom_type=ogr.wkbPolygon,
-                                                      srs=proj)
-            print(f'fields_layer: {fields_layer}')
-            for i in range(num_pedacos_x):
-                for j in range(num_pedacos_y):
-                    x_offset = i * largura_pedaco
-                    y_offset = j * altura_pedaco
-                    x_size = min(largura_pedaco, largura_imagem - x_offset)
-                    y_size = min(altura_pedaco, altura_imagem - y_offset)
+        fields_layer = fields_dataset.CreateLayer('main',
+                                                  geom_type=ogr.wkbPolygon,
+                                                  srs=proj)
+        print(f'fields_layer: {fields_layer}')
+        for i in range(num_pedacos_x):
+            for j in range(num_pedacos_y):
+                margin = 1
+                x_offset = (i * largura_pedaco)
+                y_offset = (j * altura_pedaco)
+                x_size = min(largura_pedaco, largura_imagem - x_offset)
+                y_size = min(altura_pedaco, altura_imagem - y_offset)
 
-                    x_upper_left = x_origin + x_offset * pixel_width
-                    y_upper_left = y_origin + y_offset * pixel_height
-                    x_lower_right = x_upper_left + x_size * pixel_width
-                    y_lower_right = y_upper_left + y_size * pixel_height
+                x_size_margin = x_size + margin
+                y_size_margin = y_size + margin
 
-                    pedaco_geotransform = (x_upper_left, pixel_width, 0, y_upper_left, 0, pixel_height)
+                if (x_offset + x_size_margin) > largura_imagem:
+                    x_size_final = x_size
+                else:
+                    x_size_final = x_size_margin
 
-                    pedaco = image_dataset.ReadAsArray(x_offset, y_offset, x_size, y_size)
+                if (y_offset + y_size_margin) > altura_imagem:
+                    y_size_final = y_size
+                else:
+                    y_size_final = y_size_margin
 
-                    filename, _ = os.path.splitext(os.path.basename(input_file))
+                print('X', x_size, x_size_margin, (x_offset + x_size_margin), largura_imagem)
+                print('Y', y_size, y_size_margin, (y_offset + y_size_margin), altura_imagem)
 
-                    output_chip_path = f'{tmpdirname}/{filename}_{i}_{j}.tif'
+                x_upper_left = x_origin + x_offset * pixel_width
+                y_upper_left = y_origin + y_offset * pixel_height
 
-                    driver = gdal.GetDriverByName("GTiff")
-                    pedaco_ds = driver.Create(output_chip_path, x_size, y_size, image_dataset.RasterCount,
-                                              image_dataset.GetRasterBand(1).DataType)
+                pedaco_geotransform = (x_upper_left, pixel_width, 0, y_upper_left, 0, pixel_height)
 
-                    pedaco_ds.SetGeoTransform(pedaco_geotransform)
-                    pedaco_ds.SetProjection(image_dataset.GetProjection())
+                pedaco = image_dataset.ReadAsArray(x_offset, y_offset, x_size_final, y_size_final)
 
-                    for k in range(image_dataset.RasterCount):
-                        band = pedaco_ds.GetRasterBand(k + 1)
-                        band.WriteArray(pedaco[k, :, :])
-                        band.FlushCache()
-                        del band
+                filename, _ = os.path.splitext(os.path.basename(input_file))
 
-                    pedaco_ds.FlushCache()
-                    del pedaco_ds
+                output_chip_path = f'{filename}_{i}_{j}.tif'
 
-                    output_fields_path = output_chip_path.replace('.tif', '.gpkg')
-                    self.predict(output_chip_path, output_fields_path)
+                driver = gdal.GetDriverByName("MEM")
+                pedaco_ds = driver.Create(output_chip_path, x_size_final, y_size_final, image_dataset.RasterCount,
+                                          image_dataset.GetRasterBand(1).DataType)
 
-                    chip_dataset = ogr.Open(output_fields_path)
-                    chip_layer = chip_dataset.GetLayer()
-                    for chip_feature in chip_layer:
-                        out_feat = ogr.Feature(fields_layer.GetLayerDefn())
-                        out_feat.SetGeometry(chip_feature.GetGeometryRef().Clone())
-                        fields_layer.CreateFeature(out_feat)
-                        fields_layer.SyncToDisk()
+                pedaco_ds.SetGeoTransform(pedaco_geotransform)
+                pedaco_ds.SetProjection(image_dataset.GetProjection())
+
+                for k in range(image_dataset.RasterCount):
+                    band = pedaco_ds.GetRasterBand(k + 1)
+                    band.WriteArray(pedaco[k, :, :])
+                    band.FlushCache()
+                    del band
+
+                pedaco_ds.FlushCache()
+
+                output_fields_path = output_chip_path.replace('.tif', '.gpkg')
+
+                chip_dataset = self.predict(pedaco_ds, output_fields_path)
+
+                chip_layer = chip_dataset.GetLayer()
+                for chip_feature in chip_layer:
+                    out_feat = ogr.Feature(fields_layer.GetLayerDefn())
+                    out_feat.SetGeometry(chip_feature.GetGeometryRef().Clone())
+                    fields_layer.CreateFeature(out_feat)
+                    fields_layer.SyncToDisk()
+
+        raw_gdf = gpd.read_file(output_file_raw)
+        final_gdf = self.remove_stripes(raw_gdf)
+        final_gdf.to_file(output_file)
