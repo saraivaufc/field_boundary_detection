@@ -7,7 +7,10 @@ from osgeo import gdal, osr, ogr
 from skimage import filters
 from skimage.morphology import disk
 import geopandas as gpd
+import queue
+import threading
 from shapely.validation import make_valid
+from skimage import exposure
 
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
@@ -20,25 +23,33 @@ input_Images = 'data'
 
 class SAMService:
 
-    def __init__(self, config):
+    def __init__(self, config, threads_count=4):
         sam_checkpoint = config.get('path')
         model_type = config.get('type')
         device = config.get('device')
+        self.__threads_count = threads_count
 
         sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
         sam.to(device=device)
 
-        self.__mask_generator = SamAutomaticMaskGenerator(sam, points_per_batch=1)
+        self.__mask_generator = SamAutomaticMaskGenerator(sam)
 
     def normalize_image(self, image):
+
+        in_low, in_high = np.percentile(image, (2, 98))
+        image = exposure.rescale_intensity(image, in_range=(in_low, in_high))
+
         image_min = np.min(image)
         image_max = np.max(image)
         image = np.array(((image - image_min) / (image_max - image_min)) * 255).astype(np.uint8)
+
         return image
 
     def get_masks(self, image):
+        masks = self.__mask_generator.generate(image)
+        gc.collect()
         torch.cuda.empty_cache()
-        return self.__mask_generator.generate(image)
+        return masks
 
     def convert_masks_to_full_mask(self, image, anns):
         if len(anns) == 0:
@@ -64,7 +75,6 @@ class SAMService:
         image = image.reshape((image.shape[0], image.shape[1])).astype(int)
         filled_image = filters.rank.modal(image, disk(10))
         return filled_image.reshape((filled_image.shape[0], filled_image.shape[1], 1))
-
 
     def save_full_mask(self, image_dataset, mask):
         # MEM
@@ -146,7 +156,7 @@ class SAMService:
 
         return final_gdf
 
-    def predict(self, image_dataset, output_fields_path: str):
+    def predict(self, image_dataset, output_fields_path, lock_gpu):
         print('Get array')
         image_array = image_dataset.ReadAsArray().transpose(1, 2, 0)
 
@@ -154,7 +164,8 @@ class SAMService:
         image_array = self.normalize_image(image_array)
 
         print('Generating masks...')
-        masks = self.get_masks(image_array)
+        with lock_gpu:
+            masks = self.get_masks(image_array)
 
         print('Generating full mask...')
         full_mask = self.convert_masks_to_full_mask(image_array, masks)
@@ -166,6 +177,96 @@ class SAMService:
         full_mask_image = self.save_full_mask(image_dataset, full_mask)
 
         return self.convert_raster_to_vector(full_mask_image, output_fields_path)
+
+    def process_queue(self, q, condition):
+        while True:
+            if condition.is_set() and q.empty():
+                break
+
+            try:
+                item = q.get(timeout=5)
+                if item is None:
+                    break
+            except queue.Empty:
+                break
+
+            input_file = item.get('input_file')
+            image_dataset = item.get('image_dataset')
+            lock_image_dataset = item.get('lock_image_dataset')
+            fields_layer = item.get('fields_layer')
+            x_origin = item.get('x_origin')
+            y_origin = item.get('y_origin')
+            largura_pedaco = item.get('largura_pedaco')
+            altura_pedaco = item.get('altura_pedaco')
+            largura_imagem = item.get('largura_imagem')
+            altura_imagem = item.get('altura_imagem')
+            pixel_width = item.get('pixel_width')
+            pixel_height = item.get('pixel_height')
+            i = item.get('i')
+            j = item.get('j')
+            lock_gpu = item.get('lock_gpu')
+
+            margin = 1
+            x_offset = (i * largura_pedaco)
+            y_offset = (j * altura_pedaco)
+            x_size = min(largura_pedaco, largura_imagem - x_offset)
+            y_size = min(altura_pedaco, altura_imagem - y_offset)
+
+            x_size_margin = x_size + margin
+            y_size_margin = y_size + margin
+
+            if (x_offset + x_size_margin) > largura_imagem:
+                x_size_final = x_size
+            else:
+                x_size_final = x_size_margin
+
+            if (y_offset + y_size_margin) > altura_imagem:
+                y_size_final = y_size
+            else:
+                y_size_final = y_size_margin
+
+            x_upper_left = x_origin + x_offset * pixel_width
+            y_upper_left = y_origin + y_offset * pixel_height
+
+            pedaco_geotransform = (x_upper_left, pixel_width, 0, y_upper_left, 0, pixel_height)
+
+            with lock_image_dataset:
+                pedaco = image_dataset.ReadAsArray(x_offset, y_offset, x_size_final, y_size_final)
+                pedaco_raster_count = image_dataset.RasterCount
+                pedaco_datatype = image_dataset.GetRasterBand(1).DataType
+                pedaco_projection = image_dataset.GetProjection()
+
+            filename, _ = os.path.splitext(os.path.basename(input_file))
+
+            output_chip_path = f'{filename}_{i}_{j}.tif'
+
+            driver = gdal.GetDriverByName("MEM")
+            pedaco_ds = driver.Create(output_chip_path, x_size_final, y_size_final, pedaco_raster_count,
+                                      pedaco_datatype)
+
+            pedaco_ds.SetGeoTransform(pedaco_geotransform)
+            pedaco_ds.SetProjection(pedaco_projection)
+
+            for k in range(pedaco_raster_count):
+                band = pedaco_ds.GetRasterBand(k + 1)
+                band.WriteArray(pedaco[k, :, :])
+                band.FlushCache()
+                del band
+
+            pedaco_ds.FlushCache()
+
+            output_fields_path = output_chip_path.replace('.tif', '.gpkg')
+
+            chip_dataset = self.predict(pedaco_ds, output_fields_path, lock_gpu)
+
+            chip_layer = chip_dataset.GetLayer()
+            for chip_feature in chip_layer:
+                out_feat = ogr.Feature(fields_layer.GetLayerDefn())
+                out_feat.SetGeometry(chip_feature.GetGeometryRef().Clone())
+                fields_layer.CreateFeature(out_feat)
+                fields_layer.SyncToDisk()
+
+            q.task_done()
 
     def predict_chips(self, input_file, output_file):
         image_dataset = gdal.Open(input_file)
@@ -185,6 +286,7 @@ class SAMService:
         output_file_prefix, output_file_extension = output_file.split('.')
         output_file_raw = f'{output_file_prefix}_raw.{output_file_extension}'
 
+        # Memory
         fields_driver = ogr.GetDriverByName('GPKG')
         fields_dataset = fields_driver.CreateDataSource(output_file_raw)
 
@@ -194,66 +296,48 @@ class SAMService:
                                                   geom_type=ogr.wkbPolygon,
                                                   srs=proj)
         print(f'fields_layer: {fields_layer}')
+
+        q = queue.Queue()
+        condition = threading.Event()
+
+        # Iniciar as threads
+        threads = []
+        for _ in range(self.__threads_count):
+            t = threading.Thread(target=self.process_queue, args=(q, condition))
+            t.start()
+            threads.append(t)
+
+        lock_image_dataset = threading.Lock()
+        lock_gpu = threading.Lock()
+
         for i in range(num_pedacos_x):
             for j in range(num_pedacos_y):
-                margin = 1
-                x_offset = (i * largura_pedaco)
-                y_offset = (j * altura_pedaco)
-                x_size = min(largura_pedaco, largura_imagem - x_offset)
-                y_size = min(altura_pedaco, altura_imagem - y_offset)
+                q.put({
+                    'input_file': input_file,
+                    'image_dataset': image_dataset,
+                    'lock_image_dataset': lock_image_dataset,
+                    'fields_layer': fields_layer,
+                    'largura_imagem': largura_imagem,
+                    'altura_imagem': altura_imagem,
+                    'x_origin': x_origin,
+                    'y_origin': y_origin,
+                    'pixel_width': pixel_width,
+                    'pixel_height': pixel_height,
+                    'largura_pedaco': largura_pedaco,
+                    'altura_pedaco': altura_pedaco,
+                    'num_pedacos_x': num_pedacos_x,
+                    'num_pedacos_y': num_pedacos_y,
+                    'i': i,
+                    'j': j,
+                    'lock_gpu': lock_gpu
+                })
 
-                x_size_margin = x_size + margin
-                y_size_margin = y_size + margin
+        # Esperar até que todos os itens sejam processados
+        q.join()
 
-                if (x_offset + x_size_margin) > largura_imagem:
-                    x_size_final = x_size
-                else:
-                    x_size_final = x_size_margin
-
-                if (y_offset + y_size_margin) > altura_imagem:
-                    y_size_final = y_size
-                else:
-                    y_size_final = y_size_margin
-
-                print('X', x_size, x_size_margin, (x_offset + x_size_margin), largura_imagem)
-                print('Y', y_size, y_size_margin, (y_offset + y_size_margin), altura_imagem)
-
-                x_upper_left = x_origin + x_offset * pixel_width
-                y_upper_left = y_origin + y_offset * pixel_height
-
-                pedaco_geotransform = (x_upper_left, pixel_width, 0, y_upper_left, 0, pixel_height)
-
-                pedaco = image_dataset.ReadAsArray(x_offset, y_offset, x_size_final, y_size_final)
-
-                filename, _ = os.path.splitext(os.path.basename(input_file))
-
-                output_chip_path = f'{filename}_{i}_{j}.tif'
-
-                driver = gdal.GetDriverByName("MEM")
-                pedaco_ds = driver.Create(output_chip_path, x_size_final, y_size_final, image_dataset.RasterCount,
-                                          image_dataset.GetRasterBand(1).DataType)
-
-                pedaco_ds.SetGeoTransform(pedaco_geotransform)
-                pedaco_ds.SetProjection(image_dataset.GetProjection())
-
-                for k in range(image_dataset.RasterCount):
-                    band = pedaco_ds.GetRasterBand(k + 1)
-                    band.WriteArray(pedaco[k, :, :])
-                    band.FlushCache()
-                    del band
-
-                pedaco_ds.FlushCache()
-
-                output_fields_path = output_chip_path.replace('.tif', '.gpkg')
-
-                chip_dataset = self.predict(pedaco_ds, output_fields_path)
-
-                chip_layer = chip_dataset.GetLayer()
-                for chip_feature in chip_layer:
-                    out_feat = ogr.Feature(fields_layer.GetLayerDefn())
-                    out_feat.SetGeometry(chip_feature.GetGeometryRef().Clone())
-                    fields_layer.CreateFeature(out_feat)
-                    fields_layer.SyncToDisk()
+        # Esperar até que todas as threads terminem
+        for t in threads:
+            t.join()
 
         raw_gdf = gpd.read_file(output_file_raw)
         final_gdf = self.remove_stripes(raw_gdf)
