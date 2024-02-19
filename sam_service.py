@@ -18,7 +18,6 @@ gdal.UseExceptions()
 
 largura_pedaco = 1000
 altura_pedaco = 1000
-input_Images = 'data'
 
 
 class SAMService:
@@ -28,6 +27,9 @@ class SAMService:
         model_type = config.get('type')
         device = config.get('device')
         self.__threads_count = threads_count
+
+        self.__device_semaphore = threading.Semaphore()
+        self.__image_access_semaphore = threading.Semaphore()
 
         sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
         sam.to(device=device)
@@ -46,9 +48,10 @@ class SAMService:
         return image
 
     def get_masks(self, image):
-        masks = self.__mask_generator.generate(image)
-        gc.collect()
-        torch.cuda.empty_cache()
+        with self.__device_semaphore:
+            masks = self.__mask_generator.generate(image)
+            gc.collect()
+            torch.cuda.empty_cache()
         return masks
 
     def convert_masks_to_full_mask(self, image, anns):
@@ -156,7 +159,7 @@ class SAMService:
 
         return final_gdf
 
-    def predict(self, image_dataset, output_fields_path, lock_gpu):
+    def predict(self, image_dataset, output_fields_path):
         print('Get array')
         image_array = image_dataset.ReadAsArray().transpose(1, 2, 0)
 
@@ -164,8 +167,7 @@ class SAMService:
         image_array = self.normalize_image(image_array)
 
         print('Generating masks...')
-        with lock_gpu:
-            masks = self.get_masks(image_array)
+        masks = self.get_masks(image_array)
 
         print('Generating full mask...')
         full_mask = self.convert_masks_to_full_mask(image_array, masks)
@@ -192,7 +194,6 @@ class SAMService:
 
             input_file = item.get('input_file')
             image_dataset = item.get('image_dataset')
-            lock_image_dataset = item.get('lock_image_dataset')
             fields_layer = item.get('fields_layer')
             x_origin = item.get('x_origin')
             y_origin = item.get('y_origin')
@@ -204,7 +205,6 @@ class SAMService:
             pixel_height = item.get('pixel_height')
             i = item.get('i')
             j = item.get('j')
-            lock_gpu = item.get('lock_gpu')
 
             margin = 1
             x_offset = (i * largura_pedaco)
@@ -230,7 +230,7 @@ class SAMService:
 
             pedaco_geotransform = (x_upper_left, pixel_width, 0, y_upper_left, 0, pixel_height)
 
-            with lock_image_dataset:
+            with self.__image_access_semaphore:
                 pedaco = image_dataset.ReadAsArray(x_offset, y_offset, x_size_final, y_size_final)
                 pedaco_raster_count = image_dataset.RasterCount
                 pedaco_datatype = image_dataset.GetRasterBand(1).DataType
@@ -257,7 +257,7 @@ class SAMService:
 
             output_fields_path = output_chip_path.replace('.tif', '.gpkg')
 
-            chip_dataset = self.predict(pedaco_ds, output_fields_path, lock_gpu)
+            chip_dataset = self.predict(pedaco_ds, output_fields_path)
 
             chip_layer = chip_dataset.GetLayer()
             for chip_feature in chip_layer:
@@ -307,15 +307,11 @@ class SAMService:
             t.start()
             threads.append(t)
 
-        lock_image_dataset = threading.Lock()
-        lock_gpu = threading.Lock()
-
         for i in range(num_pedacos_x):
             for j in range(num_pedacos_y):
                 q.put({
                     'input_file': input_file,
                     'image_dataset': image_dataset,
-                    'lock_image_dataset': lock_image_dataset,
                     'fields_layer': fields_layer,
                     'largura_imagem': largura_imagem,
                     'altura_imagem': altura_imagem,
@@ -328,8 +324,7 @@ class SAMService:
                     'num_pedacos_x': num_pedacos_x,
                     'num_pedacos_y': num_pedacos_y,
                     'i': i,
-                    'j': j,
-                    'lock_gpu': lock_gpu
+                    'j': j
                 })
 
         # Esperar até que todos os itens sejam processados
