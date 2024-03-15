@@ -1,7 +1,5 @@
 import os
-import gc
 import numpy as np
-import torch
 import uuid
 from osgeo import gdal, osr, ogr
 from skimage import filters
@@ -50,9 +48,7 @@ class SAMService:
     def get_masks(self, image):
         with self.__device_semaphore:
             masks = self.__mask_generator.generate(image)
-            gc.collect()
-            torch.cuda.empty_cache()
-        return masks
+            return masks
 
     def convert_masks_to_full_mask(self, image, anns):
         if len(anns) == 0:
@@ -69,8 +65,6 @@ class SAMService:
             img[:, :] = id
             stacked_image = img * m.reshape((m.shape[0], m.shape[1], 1))
             full_image = np.maximum(full_image, stacked_image)
-            del stacked_image
-            gc.collect()
             id += 1
         return full_image
 
@@ -92,7 +86,7 @@ class SAMService:
         mem_dataset.FlushCache()
         return mem_dataset
 
-    def convert_raster_to_vector(self, full_mask, output_vector_path):
+    def convert_raster_to_vector(self, full_mask):
         # reshape mask
         raster_band = full_mask.GetRasterBand(1)
 
@@ -101,7 +95,7 @@ class SAMService:
         projection.ImportFromWkt(full_mask.GetProjectionRef())
 
         # create layer
-        new_shp = ogr.GetDriverByName("Memory").CreateDataSource(output_vector_path)
+        new_shp = ogr.GetDriverByName("Memory").CreateDataSource(uuid.uuid4().hex)
         new_shp.CreateLayer('mask', geom_type=ogr.wkbPolygon, srs=projection)
 
         # get layer
@@ -159,7 +153,7 @@ class SAMService:
 
         return final_gdf
 
-    def predict(self, image_dataset, output_fields_path):
+    def predict(self, image_dataset):
         print('Get array')
         image_array = image_dataset.ReadAsArray().transpose(1, 2, 0)
 
@@ -178,7 +172,8 @@ class SAMService:
         print('Exporting full mask...')
         full_mask_image = self.save_full_mask(image_dataset, full_mask)
 
-        return self.convert_raster_to_vector(full_mask_image, output_fields_path)
+        print('Converting raster to vector...')
+        return self.convert_raster_to_vector(full_mask_image)
 
     def process_queue(self, q, condition):
         while True:
@@ -255,16 +250,17 @@ class SAMService:
 
             pedaco_ds.FlushCache()
 
-            output_fields_path = output_chip_path.replace('.tif', '.gpkg')
+            output_chip_path.replace('.tif', '.gpkg')
 
-            chip_dataset = self.predict(pedaco_ds, output_fields_path)
+            chip_dataset = self.predict(pedaco_ds)
 
             chip_layer = chip_dataset.GetLayer()
+
             for chip_feature in chip_layer:
-                out_feat = ogr.Feature(fields_layer.GetLayerDefn())
-                out_feat.SetGeometry(chip_feature.GetGeometryRef().Clone())
-                fields_layer.CreateFeature(out_feat)
-                fields_layer.SyncToDisk()
+                    out_feat = ogr.Feature(fields_layer.GetLayerDefn())
+                    out_feat.SetGeometry(chip_feature.GetGeometryRef().Clone())
+                    fields_layer.CreateFeature(out_feat)
+                    fields_layer.SyncToDisk()
 
             q.task_done()
 
