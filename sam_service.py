@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import uuid
+import tqdm
 from osgeo import gdal, osr, ogr
 from skimage import filters
 from skimage.morphology import disk
@@ -108,49 +109,52 @@ class SAMService:
         gdal.Polygonize(raster_band, None, dst_layer, 0, [], callback=None)
         return new_shp
 
-    def remove_stripes(self, old_final_gdf):
-        final_gdf = old_final_gdf.reset_index(drop=True).explode(
-            ignorar_index=True,
-            index_parts=True)
+    def remove_overlaps(self, old_final_gdf):
+        final_gdf = old_final_gdf.reset_index(drop=True).explode(ignorar_index=True)
 
         final_gdf['geometry_type'] = final_gdf.geometry.geom_type
         final_gdf = final_gdf[final_gdf['geometry_type'].isin(['Polygon', 'MultiPolygon'])]
 
         final_gdf['area_ha'] = final_gdf.area / 10000
         final_gdf = final_gdf.sort_values('area_ha')
-
+        
         final_gdf['id'] = range(len(final_gdf))
         final_gdf['new_id'] = final_gdf['id']
 
         gdf_overlaps = gpd.overlay(final_gdf, final_gdf, how='intersection', keep_geom_type=True, make_valid=True)
         gdf_overlaps['intersection_area_ha'] = gdf_overlaps['geometry'].area / 10000
-        gdf_overlaps = gdf_overlaps[
-            (gdf_overlaps['id_1'] != gdf_overlaps['id_2']) & (gdf_overlaps['intersection_area_ha'] > 0.01)]
+        gdf_overlaps = gdf_overlaps[(gdf_overlaps['id_1'] != gdf_overlaps['id_2']) & (gdf_overlaps['intersection_area_ha'] > 0.01)]
 
         gdf_overlaps['id_min'] = gdf_overlaps.apply(lambda x: min(x['id_1'], x['id_2']), axis=1)
         gdf_overlaps['id_max'] = gdf_overlaps.apply(lambda x: max(x['id_1'], x['id_2']), axis=1)
 
-        gdf_overlaps = gdf_overlaps.drop_duplicates(['id_min', 'id_max', 'intersection_area_ha'])
+        gdf_overlaps['id_1'] = gdf_overlaps['id_min']
+        gdf_overlaps['id_2'] = gdf_overlaps['id_max']
 
+        gdf_overlaps = gdf_overlaps.drop_duplicates(['id_1', 'id_2', 'intersection_area_ha'])
+        
         while True:
-            gdf_overlaps = gdf_overlaps[(gdf_overlaps['id_min'] != gdf_overlaps['id_max'])]
 
+            gdf_overlaps = gdf_overlaps[(gdf_overlaps['id_1'] != gdf_overlaps['id_2'])]
+        
             if gdf_overlaps.empty:
                 break
+        
+            for id in tqdm.tqdm(list(gdf_overlaps.sort_values('intersection_area_ha', ascending=False)['id_1'].unique())):
+                intersections_rows = gdf_overlaps[(gdf_overlaps['id_1'] == id)]
+        
+                id_2 = intersections_rows.sort_values('intersection_area_ha', ascending=False)['id_2'].to_list()[0]
 
-            for id in list(gdf_overlaps['id_min'].unique()):
-                intersections_rows = gdf_overlaps[(gdf_overlaps['id_min'] == id)]
+                gdf_overlaps.loc[(gdf_overlaps['id_1'] == id), 'id_1'] = id_2
+                
+                final_gdf.loc[final_gdf['id'] == id, 'new_id'] = id_2
+                
+            final_gdf = final_gdf.dissolve(by=['new_id'], aggfunc='first', as_index=False)
+            
 
-                id_max = intersections_rows.sort_values('intersection_area_ha', ascending=False)['id_max'].to_list()[0]
-
-                gdf_overlaps.loc[(gdf_overlaps['id_min'] == id) & (gdf_overlaps['id_max'] == id_max), 'id_max'] = id
-
-                final_gdf.loc[final_gdf['id'] == id, 'new_id'] = id_max
-
-            final_gdf['geometry'] = final_gdf['geometry'].apply(make_valid)
-            final_gdf = final_gdf.dissolve(by=['new_id'], aggfunc='max', as_index=False)
-            final_gdf['area_ha'] = final_gdf.area / 10000
-
+        final_gdf['geometry'] = final_gdf['geometry'].apply(make_valid)
+        final_gdf['area_ha'] = final_gdf.area / 10000
+            
         return final_gdf
 
     def predict(self, image_dataset):
@@ -282,7 +286,8 @@ class SAMService:
         output_file_prefix, output_file_extension = output_file.split('.')
         output_file_raw = f'{output_file_prefix}_raw.{output_file_extension}'
 
-        # Memory
+        print('output_file_raw:', output_file_raw)
+
         fields_driver = ogr.GetDriverByName('GPKG')
         fields_dataset = fields_driver.CreateDataSource(output_file_raw)
 
@@ -291,12 +296,10 @@ class SAMService:
         fields_layer = fields_dataset.CreateLayer('main',
                                                   geom_type=ogr.wkbPolygon,
                                                   srs=proj)
-        print(f'fields_layer: {fields_layer}')
 
         q = queue.Queue()
         condition = threading.Event()
 
-        # Iniciar as threads
         threads = []
         for _ in range(self.__threads_count):
             t = threading.Thread(target=self.process_queue, args=(q, condition))
@@ -323,13 +326,12 @@ class SAMService:
                     'j': j
                 })
 
-        # Esperar até que todos os itens sejam processados
         q.join()
 
-        # Esperar até que todas as threads terminem
         for t in threads:
             t.join()
 
         raw_gdf = gpd.read_file(output_file_raw)
-        final_gdf = self.remove_stripes(raw_gdf)
+        final_gdf = self.remove_overlaps(raw_gdf)
+        final_gdf = self.remove_overlaps(final_gdf)
         final_gdf.to_file(output_file)
